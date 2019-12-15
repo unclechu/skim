@@ -3,188 +3,74 @@ extern crate log;
 #[macro_use]
 extern crate lazy_static;
 mod ansi;
-mod engine;
 mod event;
-mod field;
-mod header;
-mod input;
-mod item;
-mod matcher;
-mod model;
-mod options;
-mod orderedvec;
-mod output;
-mod previewer;
-mod query;
-mod reader;
-mod score;
-mod selection;
-mod spinlock;
-mod theme;
-mod util;
 
-use crate::event::Event::*;
-use crate::event::{EventReceiver, EventSender};
-use crate::model::Model;
-pub use crate::options::{SkimOptions, SkimOptionsBuilder};
-pub use crate::output::SkimOutput;
-use crate::reader::Reader;
-pub use crate::score::FuzzyAlgorithm;
-use nix::unistd::isatty;
+use std::borrow::Cow;
 use std::env;
+use std::fmt::Display;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::os::unix::io::AsRawFd;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
 use std::thread;
-use tuikit::prelude::{Event as TermEvent, *};
+use crate::event::Event;
 
-pub struct Skim {}
-
-impl Skim {
-    pub fn run_with(options: &SkimOptions, source: Option<Box<dyn BufRead + Send>>) -> Option<SkimOutput> {
-        let min_height = options
-            .min_height
-            .map(Skim::parse_height_string)
-            .expect("min_height should have default values");
-        let height = options
-            .height
-            .map(Skim::parse_height_string)
-            .expect("height should have default values");
-
-        let (tx, rx): (EventSender, EventReceiver) = channel();
-        let term = Arc::new(Term::with_options(TermOptions::default().min_height(min_height).height(height)).unwrap());
-
-        if options.no_mouse {
-            let _ = term.disable_mouse_support();
-        } else {
-            let _ = term.enable_mouse_support();
-        }
-
-        //------------------------------------------------------------------------------
-        // input
-        let mut input = input::Input::new();
-        input.parse_keymaps(&options.bind);
-        input.parse_expect_keys(options.expect.as_ref().map(|x| &**x));
-        let tx_clone = tx.clone();
-        let term_clone = term.clone();
-        let input_thread = thread::spawn(move || 'outer: loop {
-            if let Ok(key) = term_clone.poll_event() {
-                if key == TermEvent::User1 {
-                    break;
-                }
-
-                for (ev, arg) in input.translate_event(key).into_iter() {
-                    let _ = tx_clone.send((ev, arg));
-                }
-            }
-        });
-
-        //------------------------------------------------------------------------------
-        // reader
-
-        // in piped situation(e.g. `echo "a" | sk`) set source to the pipe
-        let source = source.or_else(|| {
-            let stdin = std::io::stdin();
-            match isatty(stdin.as_raw_fd()) {
-                Ok(false) | Err(nix::Error::Sys(nix::errno::Errno::EINVAL)) => Some(Box::new(BufReader::new(stdin))),
-                Ok(true) | Err(_) => None,
-            }
-        });
-
-        let reader = Reader::with_options(&options).source(source);
-
-        //------------------------------------------------------------------------------
-        // start a timer for notifying refresh
-        let _ = tx.send((EvHeartBeat, Box::new(true)));
-
-        //------------------------------------------------------------------------------
-        // model + previewer
-        let mut model = Model::new(rx, tx, reader, term.clone(), &options);
-        let ret = model.start();
-        let _ = term.send_event(TermEvent::User1); // interrupt the input thread
-        let _ = input_thread.join();
-        let _ = term.pause();
-        ret
-    }
-
-    pub fn filter(options: &SkimOptions, source: Option<Box<dyn BufRead + Send>>) -> i32 {
-        use crate::engine::{EngineFactory, MatcherMode};
-
-        let output_ending = if options.print0 { "\0" } else { "\n" };
-        let query = options.filter;
-        let default_command = match env::var("SKIM_DEFAULT_COMMAND").as_ref().map(String::as_ref) {
-            Ok("") | Err(_) => "find .".to_owned(),
-            Ok(val) => val.to_owned(),
-        };
-
-        let cmd = options.cmd.unwrap_or(&default_command);
-
-        // output query
-        if options.print_query {
-            print!("{}{}", query, output_ending);
-        }
-
-        if options.print_cmd {
-            print!("{}{}", cmd, output_ending);
-        }
-
-        //------------------------------------------------------------------------------
-        // reader
-
-        // in piped situation(e.g. `echo "a" | sk`) set source to the pipe
-        let source = source.or_else(|| {
-            let stdin = std::io::stdin();
-            if !isatty(stdin.as_raw_fd()).unwrap_or(true) {
-                Some(Box::new(BufReader::new(stdin)))
-            } else {
-                None
-            }
-        });
-
-        let mut reader = Reader::with_options(&options).source(source);
-
-        //------------------------------------------------------------------------------
-        // matcher
-        let matcher_mode = if options.regex {
-            MatcherMode::Regex
-        } else if options.exact {
-            MatcherMode::Exact
-        } else {
-            MatcherMode::Fuzzy
-        };
-
-        let engine = EngineFactory::build(query, matcher_mode, options.algorithm);
-
-        //------------------------------------------------------------------------------
-        // start
-        let reader_control = reader.run(cmd);
-
-        let mut match_count = 0;
-        while !reader_control.is_done() {
-            for item in reader_control.take().into_iter() {
-                if let Some(matched) = engine.match_item(item) {
-                    println!("{}\t{}", -matched.rank.score, matched.item.get_output_text());
-                    match_count += 1;
-                }
-            }
-        }
-
-        if match_count == 0 {
-            return 1;
-        } else {
-            return 0;
-        }
-    }
-
-    // 10 -> TermHeight::Fixed(10)
-    // 10% -> TermHeight::Percent(10)
-    fn parse_height_string(string: &str) -> TermHeight {
-        if string.ends_with('%') {
-            TermHeight::Percent(string[0..string.len() - 1].parse().unwrap_or(100))
-        } else {
-            TermHeight::Fixed(string.parse().unwrap_or(0))
-        }
-    }
+//==============================================================================
+/// How to preview an item? Invoking a command or use provided content.
+pub enum Preview<'a> {
+    Command(&'a str),
+    Provided(&'a str),
 }
+
+pub trait SkimItem: Send + Sync {
+    /// return the raw content of an item
+    fn get_raw(&self) -> Cow<str>;
+    /// define the content to preview
+    fn get_preview(&self) -> Option<Preview>;
+}
+
+//==============================================================================
+/// reader: the one that provides items. The protocol is:
+/// - when `start` was called, reader start to collecting items.
+/// - every now and then, `take` was called by skim to take all the collected items.
+/// - every now and then `is_done` will be called to check if the reading process is done or not,
+///   so this function is better to be fast
+/// - when skim is about to quit or restart, `stop` will be called
+trait Reader {
+    fn stop(&mut self);
+    fn start(&mut self, command: &str, query: &str);
+    fn take(&mut self) -> Vec<Arc<dyn SkimItem>>;
+    fn is_done(&self) -> bool;
+}
+
+//==============================================================================
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub enum MatchedRange {
+    ByteRange(usize, usize), // range of bytes
+    Chars(Vec<usize>),       // individual character indices matched
+}
+
+/// try to match an item, return its score and the matching indices
+///
+/// Should implement `Sync` and `Send`, so that it could be use across threads.
+pub trait Matcher: Sync + Send {
+    /// Matcher is responsible for matching lots of items against one query
+    /// So it is better to do some preparation for it first and then match.
+    fn compile(&mut self, query: &str);
+
+    /// match the text and return its score and matching indices(of character)
+    fn match_item(&self, text: &str) -> Option<(i64, MatchedRange)>;
+}
+
+//==============================================================================
+pub trait SkimOutput {
+    fn query(&self) -> &str;
+    fn cmd_query(&self) -> &str;
+    fn selections(&self) -> Arc<dyn SkimItem>;
+    fn current_cursor(&self) -> Arc<dyn SkimItem>;
+    fn last_event(&self) -> Event;
+}
+
+//==============================================================================
+pub struct Skim {}
