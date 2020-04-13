@@ -362,6 +362,7 @@ fn parse_options<'a>(options: &'a ArgMatches) -> SkimOptions<'a> {
         .exact(options.is_present("exact"))
         .regex(options.is_present("regex"))
         .inline_info(options.is_present("inline-info"))
+        .select_1(options.is_present("select-1"))
         .header(options.values_of("header").and_then(|vals| vals.last()))
         .header_lines(
             options

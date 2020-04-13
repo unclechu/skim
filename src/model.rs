@@ -25,6 +25,7 @@ use crate::reader::{Reader, ReaderControl};
 use crate::selection::Selection;
 use crate::spinlock::SpinLock;
 use crate::theme::ColorTheme;
+use crate::tui::TUI;
 use crate::util::{depends_on_items, inject_command, margin_string_to_size, parse_margin, InjectContext};
 use crate::{FuzzyAlgorithm, MatchEngineFactory, SkimItem};
 
@@ -48,7 +49,7 @@ pub struct Model {
     regex_matcher: Matcher,
     matcher: Matcher,
 
-    term: Arc<Term>,
+    tui: TUI,
 
     item_pool: Arc<ItemPool>,
 
@@ -86,7 +87,7 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(rx: EventReceiver, tx: EventSender, reader: Reader, term: Arc<Term>, options: &SkimOptions) -> Self {
+    pub fn new(rx: EventReceiver, tx: EventSender, reader: Reader, tui: TUI, options: &SkimOptions) -> Self {
         let default_command = match env::var("SKIM_DEFAULT_COMMAND").as_ref().map(String::as_ref) {
             Ok("") | Err(_) => "find .".to_owned(),
             Ok(val) => val.to_owned(),
@@ -132,7 +133,7 @@ impl Model {
             use_regex: options.regex,
             regex_matcher,
             matcher,
-            term,
+            tui,
             item_pool,
 
             rx,
@@ -346,9 +347,11 @@ impl Model {
             return;
         }
 
-        let _ = self.term.pause();
-        self.act_execute_silent(cmd);
-        let _ = self.term.restart();
+        self.tui.with_term(|term| {
+            let _ = term.pause();
+            self.act_execute_silent(cmd);
+            let _ = term.restart();
+        });
     }
 
     fn act_execute_silent(&mut self, cmd: &str) {
@@ -508,17 +511,14 @@ impl Model {
                 Event::EvInputKey(key) => {
                     // dispatch key(normally the mouse keys) to sub-widgets
                     self.do_with_widget(|root| {
-                        let (width, height) = self.term.term_size().unwrap();
-                        let rect = Rectangle {
-                            top: 0,
-                            left: 0,
-                            width,
-                            height,
-                        };
-                        let messages = root.on_event(TermEvent::Key(key), rect);
-                        for message in messages {
-                            let _ = self.tx.send(message);
-                        }
+                        self.tui.with_term(|term| {
+                            let (width, height) = term.term_size().unwrap();
+                            let rect = Rectangle { top: 0, left: 0, width, height };
+                            let messages = root.on_event(TermEvent::Key(key), rect);
+                            for message in messages {
+                                let _ = self.tx.send(message);
+                            }
+                        })
                     })
                 }
 
@@ -566,8 +566,10 @@ impl Model {
                 }
             }
 
-            let _ = self.do_with_widget(|root| self.term.draw(&root));
-            let _ = self.term.present();
+            self.tui.with_term(|term| {
+                let _ = self.do_with_widget(|root| term.draw(&root));
+                let _ = term.present();
+            })
         }
     }
 

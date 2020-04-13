@@ -47,9 +47,9 @@ impl Input {
         self.keymap.entry(key).or_insert(action_chain);
     }
 
-    pub fn parse_keymaps(&mut self, maps: &[&str]) {
-        for &map in maps {
-            self.parse_keymap(map);
+    pub fn parse_keymaps(&mut self, maps: Vec<String>) {
+        for map in maps {
+            self.parse_keymap(&map);
         }
     }
 
@@ -66,7 +66,7 @@ impl Input {
         }
     }
 
-    pub fn parse_expect_keys(&mut self, keys: Option<&str>) {
+    pub fn parse_expect_keys(&mut self, keys: Option<String>) {
         if let Some(keys) = keys {
             self.bind("enter", vec![Event::EvActAccept(Some("".to_string()))]);
             for key in keys.split(',') {
